@@ -41,16 +41,17 @@ module RailsCursorPagination
     # @raise [RailsCursorPagination::ParameterError]
     #   If any parameter is not valid
     def initialize(relation, limit: nil, first: nil, after: nil, last: nil,
-                   before: nil, order_by: nil, order: nil)
+      before: nil, order_by: nil, order: nil)
       order_by ||= :id
       order ||= :asc
 
       ensure_valid_params_values!(relation, order, limit, first, last)
       ensure_valid_params_combinations!(first, last, limit, before, after)
 
-      @order_field = order_by
-      @order_direction = order
+      # Parse order_by parameter to support multiple fields
+      @order_specs = parse_order_specs(order_by, order)
       @relation = relation
+      @use_offset_pagination = (order_by == :none)
 
       @cursor = before || after
       @is_forward_pagination = before.blank?
@@ -208,14 +209,45 @@ module RailsCursorPagination
     #
     # @return [TrueClass, FalseClass]
     def custom_order_field?
-      @order_field.downcase.to_sym != :id
+      return false if @order_specs.empty?
+      
+      # Check if any order spec is not just ID
+      @order_specs.any? { |spec| spec[:column].to_s.downcase.to_sym != :id }
+    end
+
+    def use_offset_pagination?
+      @use_offset_pagination
+    end
+
+    def parse_order_specs(order_by, default_order)
+      case order_by
+      when :none
+        []
+      when Symbol, String
+        [{ column: order_by, order: default_order }]
+      when Array
+        order_by.map do |spec|
+          case spec
+          when Symbol, String
+            { column: spec, order: default_order }
+          when Hash
+            { column: spec[:column] || spec['column'], order: spec[:order] || spec['order'] || default_order }
+          else
+            raise ParameterError, "Invalid order specification: #{spec.inspect}"
+          end
+        end
+      else
+        raise ParameterError, "Invalid order_by parameter: #{order_by.inspect}"
+      end
     end
 
     # Check if there is a page before the current one.
     #
     # @return [TrueClass, FalseClass]
     def previous_page?
-      if paginate_forward?
+      if use_offset_pagination?
+        offset_pagination_previous_page?
+      elsif paginate_forward?
         # When paginating forward, we can only have a previous page if we were
         # provided with a cursor and there were records discarded after applying
         # this filter. These records would have to be on previous pages.
@@ -232,7 +264,9 @@ module RailsCursorPagination
     #
     # @return [TrueClass, FalseClass]
     def next_page?
-      if paginate_forward?
+      if use_offset_pagination?
+        offset_pagination_next_page?
+      elsif paginate_forward?
         # When paginating forward, if we managed to load one more record than
         # requested, this record will be available on the next page.
         records_plus_one.size > @page_size
@@ -248,9 +282,12 @@ module RailsCursorPagination
     #
     # @return [Array<ActiveRecord>]
     def records
-      records = records_plus_one.first(@page_size)
-
-      paginate_forward? ? records : records.reverse
+      if use_offset_pagination?
+        offset_pagination_records
+      else
+        records = records_plus_one.first(@page_size)
+        paginate_forward? ? records : records.reverse
+      end
     end
 
     # Apply limit to filtered and sorted relation that contains one item more
@@ -304,9 +341,15 @@ module RailsCursorPagination
     #
     # @return [Symbol] Either :asc or :desc
     def pagination_sorting
-      return @order_direction if paginate_forward?
+      return @order_specs if paginate_forward?
 
-      @order_direction == :asc ? :desc : :asc
+      # For backward pagination, reverse the order of each field
+      @order_specs.map do |spec|
+        {
+          column: spec[:column],
+          order: spec[:order] == :asc ? :desc : :asc
+        }
+      end
     end
 
     # Get the right operator to use in the SQL WHERE clause for filtering based
@@ -334,11 +377,13 @@ module RailsCursorPagination
     #                                    ^ records with lower value than cursor
     #
     # @return [String] either '<' or '>'
-    def filter_operator
+    def filter_operator_for_field(order_spec)
+      field_order = order_spec[:order]
+      
       if paginate_forward?
-        @order_direction == :asc ? '>' : '<'
+        field_order == :asc ? '>' : '<'
       else
-        @order_direction == :asc ? '<' : '>'
+        field_order == :asc ? '<' : '>'
       end
     end
 
@@ -365,7 +410,30 @@ module RailsCursorPagination
     # @param record [ActiveRecord] Model instance for which we want the cursor
     # @return [String]
     def cursor_for_record(record)
-      cursor_class.from_record(record: record, order_field: @order_field).encode
+      if use_offset_pagination?
+        if @cursor.present?
+          # When we have a cursor, we're getting records AFTER that position
+          # So the absolute position = cursor_position + 1 + position_in_page
+          cursor_position = decoded_cursor
+          position_in_page = records.index(record) || 0
+          absolute_position = cursor_position + 1 + position_in_page
+        else
+          # First page: position is just the index in the current page
+          position_in_page = records.index(record) || 0
+          absolute_position = position_in_page
+        end
+        Base64.strict_encode64(absolute_position.to_json)
+      else
+        if @order_specs.size == 1 && @order_specs.first[:column].to_s.downcase.to_sym == :id
+          # Single ID field - use simple cursor
+          cursor_class.from_record(record: record, order_field: :id).encode
+        else
+          # Multiple fields or custom field - encode all field values plus ID
+          field_values = @order_specs.map { |spec| record[spec[:column]] }
+          cursor_data = field_values + [record.id]
+          Base64.strict_encode64(cursor_data.to_json)
+        end
+      end
     end
 
     # Decode the provided cursor. Either just returns the cursor's ID or in case
@@ -375,7 +443,17 @@ module RailsCursorPagination
     # @return [Integer, Array]
     def decoded_cursor
       memoize(:decoded_cursor) do
-        cursor_class.decode(encoded_string: @cursor, order_field: @order_field)
+        if use_offset_pagination?
+          JSON.parse(Base64.strict_decode64(@cursor))
+        else
+          if @order_specs.size == 1 && @order_specs.first[:column].to_s.downcase.to_sym == :id
+            # Single ID field - use simple cursor decoding
+            cursor_class.decode(encoded_string: @cursor, order_field: :id)
+          else
+            # Multiple fields or custom field - decode the array
+            JSON.parse(Base64.strict_decode64(@cursor))
+          end
+        end
       end
     end
 
@@ -412,8 +490,14 @@ module RailsCursorPagination
         relation = relation.select(:id)
       end
 
-      if custom_order_field? && !@relation.select_values.include?(@order_field)
-        relation = relation.select(@order_field)
+      if custom_order_field?
+        # Add all order fields to the select
+        @order_specs.each do |spec|
+          field = spec[:column]
+          unless @relation.select_values.include?(field)
+            relation = relation.select(field)
+          end
+        end
       end
 
       relation
@@ -425,12 +509,18 @@ module RailsCursorPagination
     # @return [ActiveRecord::Relation]
     def sorted_relation
       unless custom_order_field?
-        return relation_with_cursor_fields.reorder id: pagination_sorting.upcase
+        return relation_with_cursor_fields.reorder id: pagination_sorting.first[:order].upcase
       end
 
-      relation_with_cursor_fields
-        .reorder(@order_field => pagination_sorting.upcase,
-                 id: pagination_sorting.upcase)
+      # Build the order hash for multiple fields
+      order_hash = {}
+      pagination_sorting.each do |spec|
+        order_hash[spec[:column]] = spec[:order].upcase
+      end
+      # Always add ID as the final sort field for consistency
+      order_hash[:id] = pagination_sorting.first[:order].upcase
+
+      relation_with_cursor_fields.reorder(order_hash)
     end
 
     # Return a properly escaped reference to the ID column prefixed with the
@@ -467,18 +557,74 @@ module RailsCursorPagination
         next sorted_relation if @cursor.blank?
 
         unless custom_order_field?
-          next sorted_relation.where "#{id_column} #{filter_operator} ?",
-                                     decoded_cursor.id
+          # Simple ID-only filtering
+          cursor_data = decoded_cursor
+          if cursor_data.is_a?(Integer)
+            next sorted_relation.where "#{id_column} #{filter_operator_for_field(@order_specs.first)} ?", cursor_data
+          end
         end
 
-        sorted_relation
-          .where("#{@order_field} #{filter_operator} ?",
-                 decoded_cursor.order_field_value)
-          .or(
-            sorted_relation
-              .where("#{@order_field} = ?", decoded_cursor.order_field_value)
-              .where("#{id_column} #{filter_operator} ?", decoded_cursor.id)
-          )
+        # Multiple fields filtering
+        cursor_values = decoded_cursor
+        build_multi_field_where_clause(sorted_relation, cursor_values)
+      end
+    end
+
+    def build_multi_field_where_clause(relation, cursor_values)
+      conditions = []
+      
+      # Build conditions for each field level
+      (0...@order_specs.size).each do |field_index|
+        field_spec = @order_specs[field_index]
+        field_name = field_spec[:column]
+        cursor_value = cursor_values[field_index]
+        operator = filter_operator_for_field(field_spec)
+        
+        # Build the condition for this field level
+        field_conditions = []
+        
+        # Add conditions for all previous fields being equal
+        (0...field_index).each do |prev_index|
+          prev_field = @order_specs[prev_index][:column]
+          prev_value = cursor_values[prev_index]
+          field_conditions << "#{prev_field} = ?"
+        end
+        
+        # Add the condition for current field
+        field_conditions << "#{field_name} #{operator} ?"
+        
+        # Combine with AND
+        condition = field_conditions.join(' AND ')
+        conditions << condition
+      end
+      
+      # Add ID condition for the final field
+      if cursor_values.size > @order_specs.size
+        id_value = cursor_values.last
+        id_operator = filter_operator_for_field(@order_specs.last)
+        
+        # Build condition with all fields equal and ID different
+        id_conditions = []
+        @order_specs.each_with_index do |spec, index|
+          id_conditions << "#{spec[:column]} = ?"
+        end
+        id_conditions << "#{id_column} #{id_operator} ?"
+        
+        conditions << id_conditions.join(' AND ')
+      end
+      
+      # Combine all conditions with OR
+      if conditions.size == 1
+        relation.where(conditions.first, *cursor_values, id_value)
+      else
+        or_conditions = conditions.map { |cond| "(#{cond})" }.join(' OR ')
+        all_values = []
+        conditions.each_with_index do |_, index|
+          all_values.concat(cursor_values[0..index])
+        end
+        all_values << id_value if cursor_values.size > @order_specs.size
+        
+        relation.where(or_conditions, *all_values)
       end
     end
 
@@ -493,6 +639,50 @@ module RailsCursorPagination
       return @memos[key] if @memos.key?(key)
 
       @memos[key] = yield
+    end
+
+    def offset_pagination_records
+      memoize :offset_pagination_records do
+        if @cursor.present?
+          offset = decoded_cursor
+          
+          if paginate_forward?
+            # Forward pagination: get records after the cursor position
+            @relation.offset(offset + 1).limit(@page_size).load
+          else
+            # Backward pagination: get records before the cursor position
+            start_offset = [0, offset - @page_size].max
+            @relation.offset(start_offset).limit(@page_size).load.reverse
+          end
+        else
+          # First page: start from the beginning
+          @relation.offset(0).limit(@page_size).load
+        end
+      end
+    end
+
+    def offset_pagination_previous_page?
+      return false if @cursor.blank?
+      
+      offset = decoded_cursor
+      offset > 0
+    end
+
+    def offset_pagination_next_page?
+      if @cursor.present?
+        offset = decoded_cursor
+        
+        if paginate_forward?
+          # Forward pagination: check if there are more records after current offset + page_size
+          @relation.offset(offset + @page_size + 1).limit(1).exists?
+        else
+          # Backward pagination: check if there are records before the current offset
+          offset > @page_size
+        end
+      else
+        # First page: check if there are more records after the first page
+        @relation.offset(@page_size).limit(1).exists?
+      end
     end
   end
 end
