@@ -193,7 +193,7 @@ module RailsCursorPagination
     #
     # @return [Integer]
     def total
-      memoize(:total) { @relation.reorder('').size }
+      memoize(:total) { @relation.except(:select).size }
     end
 
     # Check if the pagination direction is forward
@@ -252,7 +252,7 @@ module RailsCursorPagination
         # provided with a cursor and there were records discarded after applying
         # this filter. These records would have to be on previous pages.
         @cursor.present? &&
-          filtered_and_sorted_relation.reorder('').size < total
+          filtered_and_sorted_relation.except(:select).size < total
       else
         # When paginating backwards, if we managed to load one more record than
         # requested, this record will be available on the previous page.
@@ -274,7 +274,7 @@ module RailsCursorPagination
         # When paginating backward, if applying our cursor reduced the number
         # records returned, we know that the missing records will be on
         # subsequent pages.
-        filtered_and_sorted_relation.reorder('').size < total
+        filtered_and_sorted_relation.except(:select).size < total
       end
     end
 
@@ -648,15 +648,15 @@ module RailsCursorPagination
           
           if paginate_forward?
             # Forward pagination: get records after the cursor position
-            @relation.offset(offset + 1).limit(@page_size).load
+            @relation.offset(offset + 1).except(:select).limit(@page_size).load
           else
             # Backward pagination: get records before the cursor position
             start_offset = [0, offset - @page_size].max
-            @relation.offset(start_offset).limit(@page_size).load.reverse
+            @relation.offset(start_offset).except(:select).limit(@page_size).load.reverse
           end
         else
           # First page: start from the beginning
-          @relation.offset(0).limit(@page_size).load
+          @relation.offset(0).except(:select).limit(@page_size).load
         end
       end
     end
@@ -674,14 +674,14 @@ module RailsCursorPagination
         
         if paginate_forward?
           # Forward pagination: check if there are more records after current offset + page_size
-          @relation.offset(offset + @page_size + 1).limit(1).exists?
+          @relation.offset(offset + @page_size + 1).except(:select).limit(1).exists?
         else
           # Backward pagination: check if there are records before the current offset
           offset > @page_size
         end
       else
         # First page: check if there are more records after the first page
-        @relation.offset(@page_size).limit(1).exists?
+        @relation.offset(@page_size).except(:select).limit(1).exists?
       end
     end
   end
